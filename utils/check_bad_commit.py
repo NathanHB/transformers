@@ -15,6 +15,7 @@
 # limitations under the License.
 import argparse
 import copy
+from collections import defaultdict
 import json
 import os
 import re
@@ -338,6 +339,8 @@ if __name__ == "__main__":
         with open(args.file, "r", encoding="UTF-8") as fp:
             reports = json.load(fp)
 
+        model_with_failures = []
+
         for model in reports:
             # We change the format of "new_failures.json" in PR #XXXXX, let's handle both formats for a few weeks.
             if "failures" in reports[model]:
@@ -353,53 +356,48 @@ if __name__ == "__main__":
             reports[model].pop("multi-gpu", None)
             failed_tests = reports[model].get("single-gpu", [])
 
-            if run_idx is not None:
-                run_idx = int(run_idx)
+            model_with_failures.extend([(model, test) for test in failed_tests])
 
-                num_failed_tests_to_run = len(failed_tests) // 2
+        if run_idx is not None:
+            run_idx = int(run_idx)
 
-                start_idx = num_failed_tests_to_run * run_idx
-                end_idx = num_failed_tests_to_run * (run_idx + 1)
+            num_failed_tests_to_run = len(model_with_failures) // 2
 
-                failed_tests_to_check = failed_tests[start_idx:end_idx]
-                failed_tests = failed_tests_to_check
+            start_idx = num_failed_tests_to_run * run_idx
+            end_idx = num_failed_tests_to_run * (run_idx + 1)
 
-            failed_tests_with_bad_commits = []
-            for failure in failed_tests:
-                test = failure["line"]
-                bad_commit_info = find_bad_commit(
-                    target_test=test, start_commit=args.start_commit, end_commit=args.end_commit
-                )
-                info = {"test": test}
-                info.update(bad_commit_info)
+            model_with_failures_to_check = model_with_failures[start_idx:end_idx]
+            model_with_failures = model_with_failures_to_check
 
-                bad_commit = bad_commit_info["bad_commit"]
+        failed_tests_with_bad_commits = defaultdict(list)
+        for model, failure in model_with_failures:
+            test = failure["line"]
+            bad_commit_info = find_bad_commit(
+                target_test=test, start_commit=args.start_commit, end_commit=args.end_commit
+            )
+            info = {"test": test}
+            info.update(bad_commit_info)
 
-                if bad_commit in commit_info_cache:
-                    commit_info = commit_info_cache[bad_commit]
-                else:
-                    commit_info = get_commit_info(bad_commit)
-                    commit_info_cache[bad_commit] = commit_info
+            bad_commit = bad_commit_info["bad_commit"]
 
-                commit_info_copied = copy.deepcopy(commit_info)
-                commit_info_copied.pop("commit")
-                commit_info_copied.update({"workflow_commit": args.start_commit, "base_commit": args.end_commit})
-                info.update(commit_info_copied)
-                # put failure message toward the end
-                info = {k: v for k, v in info.items() if not k.startswith(("failure_at_", "job_link"))} | {
-                    k: v for k, v in info.items() if k.startswith(("failure_at_", "job_link"))
-                }
-
-                failed_tests_with_bad_commits.append(info)
-
-            # If no single-gpu test failures, remove the key
-            if len(failed_tests_with_bad_commits) > 0:
-                reports[model]["single-gpu"] = failed_tests_with_bad_commits
+            if bad_commit in commit_info_cache:
+                commit_info = commit_info_cache[bad_commit]
             else:
-                reports[model].pop("single-gpu", None)
+                commit_info = get_commit_info(bad_commit)
+                commit_info_cache[bad_commit] = commit_info
 
-        # remove the models without any test failure
-        reports = {k: v for k, v in reports.items() if len(v) > 0}
+            commit_info_copied = copy.deepcopy(commit_info)
+            commit_info_copied.pop("commit")
+            commit_info_copied.update({"workflow_commit": args.start_commit, "base_commit": args.end_commit})
+            info.update(commit_info_copied)
+            # put failure message toward the end
+            info = {k: v for k, v in info.items() if not k.startswith(("failure_at_", "job_link"))} | {
+                k: v for k, v in info.items() if k.startswith(("failure_at_", "job_link"))
+            }
+
+            failed_tests_with_bad_commits[model].append(info)
+
+        reports = {model: {"single-gpu": tests} for model, tests in failed_tests_with_bad_commits.items() if tests}
 
         with open(args.output_file, "w", encoding="UTF-8") as fp:
             json.dump(reports, fp, ensure_ascii=False, indent=4)
