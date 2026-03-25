@@ -256,8 +256,15 @@ jobs:
           for filepath in files:
               with open(filepath) as f:
                   data = json.load(f)
-              merged.update(data)
-          
+
+              for model, model_results in data.items():
+                  if model not in merged:
+                      merged[model] = {}
+                  for gpu_type, failures in model_results.items():
+                      if gpu_type not in merged[model]:
+                          merged[model][gpu_type] = []
+                      merged[model][gpu_type].extend(failures)
+
               print(f"filepath: {filepath}")
               print(len(data))
 
