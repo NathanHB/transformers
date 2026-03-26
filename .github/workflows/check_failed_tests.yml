@@ -95,7 +95,7 @@ jobs:
 
           print(f"n_tests: {n_tests}")
 
-          TESTS_PER_RUNNER = 10
+          TESTS_PER_RUNNER = 3
           n_runners = max(1, min(4, math.ceil(n_tests / TESTS_PER_RUNNER)))
 
           print(f"n_runners: {n_runners}")
