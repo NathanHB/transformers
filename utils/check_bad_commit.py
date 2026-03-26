@@ -316,6 +316,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_idx = os.environ.get("run_idx")
+    n_runners = os.environ.get("n_runners")
 
     print(f"start_commit: {args.start_commit}")
     print(f"end_commit: {args.end_commit}")
@@ -360,11 +361,12 @@ if __name__ == "__main__":
 
         if run_idx is not None:
             run_idx = int(run_idx)
+            n_runners = int(n_runners)
 
-            num_failed_tests_to_run = len(model_with_failures) // 2
+            num_failed_tests_to_run = len(model_with_failures) // n_runners
 
             start_idx = num_failed_tests_to_run * run_idx
-            end_idx = num_failed_tests_to_run * (run_idx + 1)
+            end_idx = num_failed_tests_to_run * (run_idx + 1) if run_idx < n_runners - 1 else len(model_with_failures)
 
             model_with_failures_to_check = model_with_failures[start_idx:end_idx]
             model_with_failures = model_with_failures_to_check
