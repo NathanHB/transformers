@@ -62,16 +62,23 @@ jobs:
 
       - name: Set matrix
         id: set-matrix
+        working-directory: /transformers
         env:
           job: ${{ inputs.job }}
         run: |
           python3 - << 'EOF'
           import json, os, math
 
+          print("Script started")
+
           job = os.environ["job"]
           filepath = f"ci_results_{job}/new_failures.json"
 
+          print(f"Looking for file: {filepath}")
+          print(f"File exists: {os.path.isfile(filepath)}")
+
           if not os.path.isfile(filepath):
+              print("File not found, setting process=false")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("process=false\n")
               exit(0)
@@ -79,18 +86,26 @@ jobs:
           with open(filepath) as f:
               reports = json.load(f)
 
+          print(f"Loaded reports with {len(reports)} models")
+
           n_tests = sum(
               len(model_data.get("failures", model_data).get("single-gpu", []))
               for model_data in reports.values()
           )
 
+          print(f"n_tests: {n_tests}")
+
           TESTS_PER_RUNNER = 10
           n_runners = max(1, min(4, math.ceil(n_tests / TESTS_PER_RUNNER)))
+
+          print(f"n_runners: {n_runners}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={json.dumps(list(range(n_runners)))}\n")
               f.write(f"n_runners={n_runners}\n")
               f.write("process=true\n")
+
+          print("Done")
           EOF
 
 
