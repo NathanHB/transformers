@@ -532,6 +532,9 @@ class CLIPModelTest(CLIPModelTesterMixin, PipelineTesterMixin, unittest.TestCase
     def test_foo_2(self):
         assert 2 == 3
 
+    def test_foo_3(self):
+        assert 3 == 4
+
     def test_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_model(*config_and_inputs)

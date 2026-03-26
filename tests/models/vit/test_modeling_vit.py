@@ -221,9 +221,6 @@ class ViTModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     def test_foo_4(self):
         assert 4 == 5
 
-    def test_foo_5(self):
-        assert 5 == 6
-
     @unittest.skip(
         "Since `torch==2.3+cu121`, although this test passes, many subsequent tests have `CUDA error: misaligned address`."
         "If `nvidia-xxx-cu118` are also installed, no failure (even with `torch==2.3+cu121`)."
