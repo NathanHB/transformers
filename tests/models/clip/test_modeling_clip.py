@@ -526,11 +526,11 @@ class CLIPModelTest(CLIPModelTesterMixin, PipelineTesterMixin, unittest.TestCase
             self, config_class=CLIPConfig, has_text_modality=False, common_properties=common_properties
         )
 
-    def test_foo_1(self):
-        assert 1 == 2
-
-    def test_foo_2(self):
-        assert 2 == 3
+    # def test_foo_1(self):
+    #     assert 1 == 2
+    #
+    # def test_foo_2(self):
+    #     assert 2 == 3
 
     def test_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
