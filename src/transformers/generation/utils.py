@@ -1897,8 +1897,11 @@ class GenerationMixin(ContinuousMixin):
         This adds exception for some models like `Mamba` models which use their own caches.
         """
         # NOTE: remove xlnet/reformer when the models are deprecated, non-standard model architecture/cache name
+        model_name = cls.__name__.lower()
+        if model_name.startswith("minimaxm2"):
+            return not cls._is_stateful
         return not cls._is_stateful and all(
-            special_model_name not in cls.__name__.lower()
+            special_model_name not in model_name
             for special_model_name in [
                 "reformer",
                 "minimax",

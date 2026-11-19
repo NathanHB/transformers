@@ -206,6 +206,116 @@ class MergeModulelist(ConversionOps):
         return SplitModulelist(self.dim)
 
 
+class MergeMiniMaxM2Experts(ConversionOps):
+    """Pack MiniMax-M2 expert projections, optionally dequantizing their FP8 tensors first."""
+
+    def __init__(self, dim: int = 0, num_projections: int = 1):
+        self.dim = dim
+        self.num_projections = num_projections
+
+    @staticmethod
+    def _dequantize(weight: torch.Tensor, scale: torch.Tensor, block_size: list[int] | None) -> torch.Tensor:
+        rows, cols = weight.shape[-2:]
+        if block_size is None:
+            block_size = (rows, cols)
+        block_m, block_n = block_size
+        if rows % block_m != 0 or cols % block_n != 0:
+            raise ValueError(
+                f"Matrix dimensions ({rows}, {cols}) must be divisible by block sizes ({block_m}, {block_n})."
+            )
+        weight = weight.to(scale.dtype)
+        weight = weight.reshape(rows // block_m, block_m, cols // block_n, block_n)
+        scale = scale.reshape(rows // block_m, cols // block_n).unsqueeze(-1).unsqueeze(1)
+        return (weight * scale).reshape(rows, cols)
+
+    @torch.no_grad()
+    def convert(
+        self,
+        input_dict: dict[str, list[torch.Tensor]],
+        source_patterns: list[str],
+        target_patterns: list[str],
+        model=None,
+        hf_quantizer=None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        weight_patterns = [pattern for pattern in source_patterns if pattern.endswith(".weight")]
+        scale_patterns = [f"{pattern}_scale_inv" for pattern in weight_patterns]
+        scale_present = [pattern in input_dict for pattern in scale_patterns]
+        if any(scale_present) and not all(scale_present):
+            raise ValueError("Either all MiniMax-M2 expert projections must have FP8 scales, or none of them may.")
+
+        quantizer = hf_quantizer if hf_quantizer is not None else getattr(model, "hf_quantizer", None)
+        dequantize = bool(
+            quantizer is not None and quantizer.pre_quantized and quantizer.quantization_config.dequantize
+        )
+        if dequantize and not all(scale_present):
+            raise ValueError("FP8 scales are required to dequantize MiniMax-M2 expert projections.")
+
+        weight_groups = []
+        scale_groups = []
+        for weight_pattern, scale_pattern in zip(weight_patterns, scale_patterns):
+            weights = input_dict[weight_pattern]
+            if all(scale_present):
+                scales = input_dict[scale_pattern]
+                if len(weights) != len(scales):
+                    raise ValueError("MiniMax-M2 expert weights and FP8 scales must have the same expert count.")
+                if dequantize:
+                    block_size = quantizer.quantization_config.weight_block_size
+                    weights = [self._dequantize(weight, scale, block_size) for weight, scale in zip(weights, scales)]
+                else:
+                    scale_groups.append(torch.stack(scales, dim=0))
+            weight_groups.append(torch.stack(weights, dim=0))
+
+        if len(weight_groups) != self.num_projections:
+            raise ValueError(f"Expected {self.num_projections} expert projections, received {len(weight_groups)}.")
+        weight = torch.cat(weight_groups, dim=self.dim) if self.num_projections > 1 else weight_groups[0]
+        output = {target_patterns[0]: weight}
+        if scale_groups and not dequantize:
+            scale = torch.cat(scale_groups, dim=self.dim) if self.num_projections > 1 else scale_groups[0]
+            output[target_patterns[1]] = scale
+        return output
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        return SplitMiniMaxM2Experts(dim=self.dim, num_projections=self.num_projections)
+
+
+class SplitMiniMaxM2Experts(ConversionOps):
+    """Unpack MiniMax-M2 expert projections and their optional FP8 scales."""
+
+    def __init__(self, dim: int = 0, num_projections: int = 1):
+        self.dim = dim
+        self.num_projections = num_projections
+
+    @torch.no_grad()
+    def convert(
+        self,
+        input_dict: dict[str, list[torch.Tensor]],
+        source_patterns: list[str],
+        target_patterns: list[str],
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        weight = input_dict[source_patterns[0]][0]
+        scales = input_dict.get(source_patterns[1]) if len(source_patterns) > 1 else None
+        scale = scales[0] if scales is not None else None
+        weight_groups = list(weight.chunk(self.num_projections, dim=self.dim))
+        scale_groups = list(scale.chunk(self.num_projections, dim=self.dim)) if scale is not None else None
+        weight_patterns = [pattern for pattern in target_patterns if pattern.endswith(".weight")]
+
+        output = {}
+        for projection, weight_pattern in enumerate(weight_patterns):
+            scale_pattern = f"{weight_pattern}_scale_inv"
+            for expert, expert_weight in enumerate(weight_groups[projection].unbind(dim=0)):
+                output[weight_pattern.replace("*", str(expert))] = expert_weight
+                if scale_groups is not None:
+                    output[scale_pattern.replace("*", str(expert))] = scale_groups[projection][expert]
+        return output
+
+    @property
+    def reverse_op(self) -> ConversionOps:
+        return MergeMiniMaxM2Experts(dim=self.dim, num_projections=self.num_projections)
+
+
 class SplitModulelist(ConversionOps):
     """Inverse of :class:`MergeModulelist` using explicit split sizes per group."""
 
@@ -439,6 +549,40 @@ class Transpose(ConversionOps):
         return Transpose(dim0=self.dim1, dim1=self.dim0)
 
 
+class Fp8Dequantize(ConversionOps):
+    """Reconstruct a tensor from FP8 values and their block-wise inverse scales."""
+
+    def __init__(self, hf_quantizer):
+        self.hf_quantizer = hf_quantizer
+
+    def convert(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        full_layer_name: str | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        if len(input_dict) < 2:
+            return {full_layer_name: input_dict["weight$"]}
+
+        quantized = input_dict["weight$"][0]
+        scales = input_dict["weight_scale_inv"][0]
+        rows, cols = quantized.shape[-2:]
+        block_size = self.hf_quantizer.quantization_config.weight_block_size
+        if block_size is None:
+            block_size = (quantized.shape[-2], quantized.shape[-1])
+        block_m, block_n = block_size
+        if rows % block_m != 0 or cols % block_n != 0:
+            raise ValueError(
+                f"Matrix dimensions ({rows}, {cols}) must be divisible by block sizes ({block_m}, {block_n})."
+            )
+        quantized = quantized.to(scales.dtype)
+        reshaped = quantized.reshape(-1, rows // block_m, block_m, cols // block_n, block_n)
+        expanded_scales = scales.reshape(-1, rows // block_m, cols // block_n)
+        expanded_scales = expanded_scales.unsqueeze(-1).unsqueeze(2)
+        dequantized = reshaped * expanded_scales
+        return {full_layer_name: dequantized.reshape(quantized.shape)}
+
+
 @dataclass(slots=True)
 class WeightTransform:
     source_patterns: str | list[str] = field(init=True)
@@ -605,6 +749,8 @@ class WeightRenaming(WeightTransform):
 _INTERNAL_MANY_TO_MANY_CONVERSIONS = (
     ErnieFuseAndSplitTextVisionExperts,
     ErnieSplitAndDecoupleTextVisionExperts,
+    MergeMiniMaxM2Experts,
+    SplitMiniMaxM2Experts,
 )
 
 
@@ -646,6 +792,7 @@ class WeightConverter(WeightTransform):
                     full_layer_name=layer_name,
                     model=model,
                     config=config,
+                    hf_quantizer=hf_quantizer,
                     missing_keys=missing_keys,
                 )
 
@@ -677,6 +824,18 @@ class WeightConverter(WeightTransform):
                     missing_keys=missing_keys,
                 )
         return collected_tensors, conversion_errors
+
+
+class MiniMaxM2WeightConverter(WeightConverter):
+    """Weight converter whose weight and scale source patterns have a common prefix."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        branches = []
+        for i in sorted(range(len(self.source_patterns)), key=lambda i: len(self.source_patterns[i]), reverse=True):
+            pattern = self.source_patterns[i].replace(".*.", r"\..*\.")
+            branches.append(f"(?P<g{i}>{pattern})")
+        self.compiled_sources = re.compile("|".join(branches))
 
 
 # For I/O bound operations (i.e. here reading files), it is better to have fewer threads, e.g. 4 is a good default.
