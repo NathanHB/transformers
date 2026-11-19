@@ -1901,7 +1901,6 @@ class GenerationMixin(ContinuousMixin):
             special_model_name not in cls.__name__.lower()
             for special_model_name in [
                 "reformer",
-                "minimax",
                 "xlnet",
                 "lfm2",
                 "lfm2_vl",

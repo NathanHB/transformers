@@ -525,6 +525,10 @@ class MiniMaxPreTrainedModel(MixtralPreTrainedModel):
         "attentions": [MiniMaxAttention, MiniMaxLightningAttention],
     }
 
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
+
     def _init_weights(self, module):
         super()._init_weights(module)
         if isinstance(module, MiniMaxLightningAttention):

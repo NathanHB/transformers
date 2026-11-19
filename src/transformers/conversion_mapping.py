@@ -236,6 +236,9 @@ def _build_checkpoint_conversion_mapping():
     mapping["qwen3_vl_moe"] = mapping["qwen2_moe"].copy()
     mapping["hunyuan_v1_moe"] = mapping["qwen2_moe"].copy()
     mapping["minimax"] = mapping["mixtral"].copy()
+    mapping["minimax_m2"] = [
+        WeightRenaming(".block_sparse_moe.e_score_correction_bias", ".mlp.gate.e_score_correction_bias")
+    ] + mapping["mixtral"].copy()
     mapping["flex_olmo"] = mapping["qwen2_moe"].copy()
     mapping["olmoe"] = mapping["qwen2_moe"].copy()
 

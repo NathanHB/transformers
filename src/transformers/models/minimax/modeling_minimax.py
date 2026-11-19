@@ -626,6 +626,10 @@ class MiniMaxPreTrainedModel(PreTrainedModel):
             init.copy_(module.key_decay, key_decay)
             init.copy_(module.diagonal_decay, diagonal_decay)
 
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
+
 
 @auto_docstring
 class MiniMaxModel(MiniMaxPreTrainedModel):
