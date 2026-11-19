@@ -17,6 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_rope_utils import RopeParameters
 
@@ -69,20 +70,19 @@ class MiniMaxM2Config(PreTrainedConfig):
             The id of the end-of-sequence token.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether the input and output word embeddings should be tied.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use a bias in the query, key, value and output projection layers.
         attention_dropout (`float`, *optional*, defaults to 0.0):
             Dropout ratio for the attention probabilities.
         num_experts_per_tok (`int`, *optional*, defaults to 8):
             Number of experts selected for each token.
         num_local_experts (`int`, *optional*, defaults to 256):
             Number of experts in each sparse MLP layer.
-        output_router_logits (`bool`, *optional*, defaults to `False`):
-            Whether to return router logits and compute Mixtral's generic auxiliary load-balancing loss.
-        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
-            Coefficient of Mixtral's generic auxiliary load-balancing loss in the total loss.
+        rope_theta (`float`, *optional*, defaults to 5000000.0):
+            The base period of the rotary position embeddings.
         rope_parameters (`RopeParameters` or `dict`, *optional*):
-            Parameters for rotary position embeddings. By default, `rope_theta` is 5000000.0, `rope_type` is
-            `"default"`, and `partial_rotary_factor` is 0.5. Legacy `rope_theta`, `rope_scaling`, and `rotary_dim`
-            arguments are also accepted.
+            Parameters for rotary position embeddings. By default, `rope_type` is `"default"` and
+            `partial_rotary_factor` is 0.5, so rotary embeddings are applied to half of each attention head.
         kwargs (`dict`, *optional*):
             Additional configuration arguments.
 
@@ -135,50 +135,14 @@ class MiniMaxM2Config(PreTrainedConfig):
         bos_token_id: int | None = 0,
         eos_token_id: int | None = 200020,
         tie_word_embeddings: bool | None = False,
+        attention_bias: bool | None = False,
         attention_dropout: float | None = 0.0,
         num_experts_per_tok: int | None = 8,
         num_local_experts: int | None = 256,
-        output_router_logits: bool | None = False,
-        router_aux_loss_coef: float | None = 0.001,
+        rope_theta: float | None = 5_000_000.0,
         rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
         **kwargs,
     ):
-        # These remote-code options describe features that are fixed or unused in this architecture.
-        for key in (
-            "attn_type_list",
-            "num_mtp_modules",
-            "mtp_transformer_layers",
-            "qk_norm_type",
-            "scoring_func",
-            "shared_intermediate_size",
-            "sliding_window",
-            "router_jitter_noise",
-            "use_mtp",
-            "use_qk_norm",
-            "use_routing_bias",
-        ):
-            kwargs.pop(key, None)
-
-        rope_scaling = kwargs.pop("rope_scaling", None)
-        if rope_scaling is not None:
-            rope_parameters = rope_scaling
-        rope_parameters = dict(rope_parameters) if rope_parameters is not None else {}
-
-        head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
-        rotary_dim = kwargs.pop("rotary_dim", None)
-        partial_rotary_factor = kwargs.pop("partial_rotary_factor", None)
-        if rotary_dim is not None:
-            if rotary_dim % 2 != 0:
-                raise ValueError(f"`rotary_dim` must be an even number, but got {rotary_dim}.")
-            if rotary_dim > head_dim:
-                raise ValueError(
-                    f"`rotary_dim` must be smaller than or equal to `head_dim`, but got {rotary_dim} > {head_dim}."
-                )
-            partial_rotary_factor = rotary_dim / head_dim
-        if partial_rotary_factor is not None:
-            rope_parameters["partial_rotary_factor"] = partial_rotary_factor
-        else:
-            rope_parameters.setdefault("partial_rotary_factor", 0.5)
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -195,23 +159,24 @@ class MiniMaxM2Config(PreTrainedConfig):
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
+        self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.head_dim = head_dim
-
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.rope_parameters = rope_parameters
+        kwargs.setdefault("partial_rotary_factor", 0.5)
+        if "rotary_dim" in kwargs:
+            kwargs["partial_rotary_factor"] = kwargs.pop("rotary_dim") / self.head_dim
+        self.rope_parameters = rope_parameters if rope_parameters is not None else {"partial_rotary_factor": 0.5}
 
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            rope_theta=rope_theta,
             **kwargs,
         )
-        self.attention_bias = False
 
 
 __all__ = ["MiniMaxM2Config"]

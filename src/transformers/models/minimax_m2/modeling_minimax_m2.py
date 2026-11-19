@@ -32,12 +32,12 @@ from ...generation import GenerationMixin
 from ...integrations import use_experts_implementation, use_kernel_forward_from_hub, use_kernelized_func
 from ...masking_utils import create_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
+from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_grouped_mm_available
-from ...utils.generic import OutputRecorder, check_model_inputs, maybe_autocast
+from ...utils.generic import check_model_inputs, maybe_autocast
 from .configuration_minimax_m2 import MiniMaxM2Config
 
 
@@ -190,22 +190,17 @@ class MiniMaxM2TopKRouter(nn.Module):
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: MiniMaxM2Config):
         super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.jitter_noise = 0.0
-        self.gate = MiniMaxM2TopKRouter(config)
         self.experts = MiniMaxM2Experts(config)
+        self.gate = MiniMaxM2TopKRouter(config)
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        _, top_k_weights, top_k_index = self.gate(hidden_states)
-        hidden_states = self.experts(hidden_states, top_k_index, top_k_weights)
-        hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return hidden_states
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -423,7 +418,6 @@ class MiniMaxM2PreTrainedModel(PreTrainedModel):
     )  # https://huggingface.co/docs/transformers/experts_interface#torchcompile
     _supports_attention_backend = True
     _can_record_outputs = {
-        "router_logits": OutputRecorder(MiniMaxM2TopKRouter, index=0),
         "hidden_states": MiniMaxM2DecoderLayer,
         "attentions": MiniMaxM2Attention,
     }
@@ -448,7 +442,6 @@ class MiniMaxM2Model(MiniMaxM2PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [MiniMaxM2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -490,7 +483,7 @@ class MiniMaxM2Model(MiniMaxM2PreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        causal_mask = create_causal_mask(  # diff with mixtral: no sliding
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -524,88 +517,6 @@ class MiniMaxM2Model(MiniMaxM2PreTrainedModel):
         )
 
 
-def load_balancing_loss_func(
-    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
-    num_experts: int | None = None,
-    top_k=2,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor | int:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits:
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        num_experts:
-            Number of experts
-        top_k:
-            The number of experts to route per-token, can be also interpreted as the `top-k` routing
-            parameter.
-        attention_mask (`torch.Tensor`, *optional*):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
-        return 0
-
-    if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
-
-
 @auto_docstring
 class MiniMaxM2ForCausalLM(MiniMaxM2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -617,9 +528,6 @@ class MiniMaxM2ForCausalLM(MiniMaxM2PreTrainedModel, GenerationMixin):
         self.model = MiniMaxM2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.router_aux_loss_coef = config.router_aux_loss_coef
-        self.num_experts = config.num_local_experts
-        self.num_experts_per_tok = config.num_experts_per_tok
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -635,47 +543,31 @@ class MiniMaxM2ForCausalLM(MiniMaxM2PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_router_logits: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> MoeCausalLMOutputWithPast:
+    ) -> CausalLMOutputWithPast:
         r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
         Example:
 
         ```python
         >>> from transformers import AutoTokenizer, MiniMaxM2ForCausalLM
 
-        >>> model = MiniMaxM2ForCausalLM.from_pretrained("mistralai/MiniMaxM2-8x7B-v0.1")
-        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/MiniMaxM2-8x7B-v0.1")
+        >>> model = MiniMaxM2ForCausalLM.from_pretrained("MiniMaxAI/MiniMax-M2.5")
+        >>> tokenizer = AutoTokenizer.from_pretrained("MiniMaxAI/MiniMax-M2.5")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
 
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        >>> generate_ids = model.generate(inputs.input_ids, max_new_tokens=30)
         ```"""
-
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
-
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs: MoeModelOutputWithPast = self.model(
+        outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_router_logits=output_router_logits,
             cache_position=cache_position,
             **kwargs,
         )
@@ -687,27 +579,14 @@ class MiniMaxM2ForCausalLM(MiniMaxM2PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        aux_loss = None
-        if output_router_logits:
-            aux_loss = load_balancing_loss_func(
-                outputs.router_logits,
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
-            )
-            if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
-
-        return MoeCausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
-            aux_loss=aux_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            router_logits=outputs.router_logits,
         )
 
 
