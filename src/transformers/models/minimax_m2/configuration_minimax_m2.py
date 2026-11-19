@@ -156,9 +156,7 @@ class MiniMaxM2Config(PreTrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts
         self.rope_parameters = rope_parameters if rope_parameters is not None else {}
-        self.rope_parameters.setdefault(
-            "partial_rotary_factor", kwargs.pop("rotary_dim", self.head_dim // 2) / self.head_dim
-        )
+        kwargs.setdefault("partial_rotary_factor", 0.5)  # assign default for BC
 
         super().__init__(
             pad_token_id=pad_token_id,
