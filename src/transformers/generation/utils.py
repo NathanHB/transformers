@@ -1897,18 +1897,14 @@ class GenerationMixin(ContinuousMixin):
         This adds exception for some models like `Mamba` models which use their own caches.
         """
         # NOTE: remove xlnet/reformer when the models are deprecated, non-standard model architecture/cache name
-        return (
-            not cls._is_stateful
-            and not getattr(cls, "_uses_custom_cache", False)
-            and all(
-                special_model_name not in cls.__name__.lower()
-                for special_model_name in [
-                    "reformer",
-                    "xlnet",
-                    "lfm2",
-                    "lfm2_vl",
-                ]
-            )
+        return not cls._is_stateful and all(
+            special_model_name not in cls.__name__.lower()
+            for special_model_name in [
+                "reformer",
+                "xlnet",
+                "lfm2",
+                "lfm2_vl",
+            ]
         )
 
     def _prepare_cache_for_generation(

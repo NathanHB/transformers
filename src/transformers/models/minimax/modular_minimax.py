@@ -518,13 +518,16 @@ class MiniMaxDecoderLayer(MixtralDecoderLayer, GradientCheckpointingLayer):
 
 
 class MiniMaxPreTrainedModel(MixtralPreTrainedModel):
-    _uses_custom_cache = True  # MiniMaxCache
     _can_compile_fullgraph = False  # uses a non-compilable custom cache class MiniMaxCache
     _can_record_outputs = {
         "router_logits": OutputRecorder(MiniMaxTopKRouter, layer_name="mlp.gate", index=0),
         "hidden_states": MiniMaxDecoderLayer,
         "attentions": [MiniMaxAttention, MiniMaxLightningAttention],
     }
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
 
     def _init_weights(self, module):
         super()._init_weights(module)

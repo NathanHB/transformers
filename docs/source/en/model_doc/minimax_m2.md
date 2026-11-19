@@ -16,11 +16,11 @@ rendered properly in your Markdown viewer.
 
 # MiniMax-M2
 
-*This model was released on 2026-02-12 and added to Hugging Face Transformers on 2026-11-18.*
+*This model was released on 2025-10-27 and added to Hugging Face Transformers on 2026-11-18.*
 
 ## Overview
 
-MiniMax-M2 is a sparse mixture-of-experts causal language model developed by MiniMax. The architecture combines grouped-query attention with partial rotary position embeddings and per-projection query/key normalization. Each decoder layer routes tokens to a subset of feed-forward experts using sigmoid routing scores and a correction bias for expert selection.
+[MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) is a sparse mixture-of-experts causal language model developed by MiniMax and introduced in the [official announcement](https://www.minimax.io/news/minimax-m2). The architecture combines grouped-query attention with partial rotary position embeddings and per-projection query/key normalization. Each decoder layer routes tokens to a subset of feed-forward experts using sigmoid routing scores and a correction bias for expert selection. The released checkpoints, including MiniMax-M2.5, are available in the [MiniMax-M2 collection](https://huggingface.co/collections/MiniMaxAI/minimax-m2-69607bef9bd3881ee76e11cb).
 
 ```python
 import torch

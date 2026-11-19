@@ -608,7 +608,6 @@ class MiniMaxPreTrainedModel(PreTrainedModel):
         "hidden_states": MiniMaxDecoderLayer,
         "attentions": [MiniMaxAttention, MiniMaxLightningAttention],
     }
-    _uses_custom_cache = True  # MiniMaxCache
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -626,6 +625,10 @@ class MiniMaxPreTrainedModel(PreTrainedModel):
             init.copy_(module.query_decay, query_decay)
             init.copy_(module.key_decay, key_decay)
             init.copy_(module.diagonal_decay, diagonal_decay)
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        return False
 
 
 @auto_docstring

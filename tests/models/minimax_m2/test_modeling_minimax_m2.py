@@ -16,7 +16,12 @@
 import unittest
 
 from transformers import is_torch_available
-from transformers.testing_utils import require_read_token, require_torch, require_torch_accelerator, slow
+from transformers.testing_utils import (
+    require_torch,
+    require_torch_large_accelerator,
+    require_torch_multi_accelerator,
+    slow,
+)
 
 
 if is_torch_available():
@@ -35,26 +40,30 @@ class MiniMaxM2ModelTester(CausalLMModelTester):
 @require_torch
 class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
     model_tester_class = MiniMaxM2ModelTester
-    # Not every expert or the routing-correction bias receives a gradient in a small routed batch.
-    test_all_params_have_gradient = False
 
 
-@require_torch_accelerator
+# The released FP8 checkpoint needs multiple large accelerators for its roughly 230B parameters.
+@require_torch
+@require_torch_multi_accelerator
+@require_torch_large_accelerator(memory=64)
 @slow
-@require_read_token
 class MiniMaxM2IntegrationTest(unittest.TestCase):
     def test_released_checkpoint_generation(self):
         checkpoint = "MiniMaxAI/MiniMax-M2.5"
         tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        model = AutoModelForCausalLM.from_pretrained(checkpoint, device_map="auto", dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(checkpoint, device_map="auto", dtype="auto")
         inputs = tokenizer("The capital of France is", return_tensors="pt").to(model.device)
 
         with torch.no_grad():
-            generated = model.generate(**inputs, max_new_tokens=1, do_sample=False)
+            generated_with_cache = model.generate(
+                **inputs, max_new_tokens=20, min_new_tokens=20, do_sample=False, use_cache=True
+            )
+            generated_without_cache = model.generate(
+                **inputs, max_new_tokens=20, min_new_tokens=20, do_sample=False, use_cache=False
+            )
 
-        self.assertEqual(generated[0, -1:].tolist(), [8261])
-        response = tokenizer.decode(generated[0, -1:], skip_special_tokens=True)
-        self.assertEqual(response, " Paris")
+        self.assertEqual(generated_with_cache.shape[1], inputs.input_ids.shape[1] + 20)
+        self.assertEqual(generated_with_cache.tolist(), generated_without_cache.tolist())
 
 
 if __name__ == "__main__":

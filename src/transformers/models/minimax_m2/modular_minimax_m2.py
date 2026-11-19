@@ -58,11 +58,9 @@ class MiniMaxM2Config(PreTrainedConfig):
         num_key_value_heads (`int`, *optional*, defaults to 8):
             Number of key-value heads used to implement grouped-query attention. If
             `num_key_value_heads=num_attention_heads`, the model uses multi-head attention; if
-            `num_key_value_heads=1`, it uses multi-query attention. If set to `None`, this defaults to
-            `num_attention_heads`.
+            `num_key_value_heads=1`, it uses multi-query attention.
         head_dim (`int`, *optional*, defaults to 128):
-            Dimension of each attention head. If set to `None`, this defaults to
-            `hidden_size // num_attention_heads`.
+            Dimension of each attention head.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function in the experts.
         max_position_embeddings (`int`, *optional*, defaults to 196608):
@@ -89,8 +87,6 @@ class MiniMaxM2Config(PreTrainedConfig):
             Number of experts selected for each token.
         num_local_experts (`int`, *optional*, defaults to 256):
             Number of experts in each sparse MLP layer.
-        rope_theta (`float`, *optional*, defaults to 5000000.0):
-            The base period of the rotary position embeddings.
         rope_parameters (`RopeParameters` or `dict`, *optional*):
             Parameters for rotary position embeddings. By default, `rope_type` is `"default"` and
             `partial_rotary_factor` is 0.5, so rotary embeddings are applied to half of each attention head.
@@ -150,7 +146,6 @@ class MiniMaxM2Config(PreTrainedConfig):
         attention_dropout: float | None = 0.0,
         num_experts_per_tok: int | None = 8,
         num_local_experts: int | None = 256,
-        rope_theta: float | None = 5_000_000.0,
         rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
         **kwargs,
     ):
@@ -161,10 +156,6 @@ class MiniMaxM2Config(PreTrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
 
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
@@ -172,20 +163,19 @@ class MiniMaxM2Config(PreTrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+        self.head_dim = head_dim
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts
-        kwargs.setdefault("partial_rotary_factor", 0.5)
-        if "rotary_dim" in kwargs:
-            kwargs["partial_rotary_factor"] = kwargs.pop("rotary_dim") / self.head_dim
-        self.rope_parameters = rope_parameters if rope_parameters is not None else {"partial_rotary_factor": 0.5}
+        self.rope_parameters = rope_parameters if rope_parameters is not None else {}
+        self.rope_parameters.setdefault(
+            "partial_rotary_factor", kwargs.pop("rotary_dim", self.head_dim // 2) / self.head_dim
+        )
 
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            rope_theta=rope_theta,
             **kwargs,
         )
 
@@ -210,6 +200,7 @@ class MiniMaxM2TopKRouter(MixtralTopKRouter):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states, self.weight)
+        # The only difference from MixtralTopKRouter is ungrouped sigmoid routing with a correction bias.
         routing_weights = torch.sigmoid(router_logits.float())
         scores_for_choice = routing_weights + self.e_score_correction_bias
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)

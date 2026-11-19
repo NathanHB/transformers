@@ -1144,8 +1144,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
     supports_gradient_checkpointing = False
     _is_stateful = False
-    # Whether the model requires a custom cache instead of the default `DynamicCache`.
-    _uses_custom_cache = False
 
     # Flash Attention support
     _supports_flash_attn = False
