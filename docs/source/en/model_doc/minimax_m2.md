@@ -16,13 +16,11 @@ rendered properly in your Markdown viewer.
 
 # MiniMax-M2
 
-*This model was released on {release_date} and added to Hugging Face Transformers on 2026-11-18.*
+*This model was released on 2026-02-12 and added to Hugging Face Transformers on 2026-11-18.*
 
 ## Overview
 
 MiniMax-M2 is a sparse mixture-of-experts causal language model developed by MiniMax. The architecture combines grouped-query attention with partial rotary position embeddings and per-projection query/key normalization. Each decoder layer routes tokens to a subset of feed-forward experts using sigmoid routing scores and a correction bias for expert selection.
-
-The implementation converts the original per-expert checkpoint layout to the packed expert layout used by Transformers.
 
 ```python
 import torch
@@ -33,9 +31,11 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = MiniMaxM2ForCausalLM.from_pretrained(model_id, dtype="auto", device_map="auto")
 
 messages = [{"role": "user", "content": "Explain sparse mixture-of-experts models in one paragraph."}]
-input_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
-outputs = model.generate(input_ids, max_new_tokens=128)
-print(tokenizer.decode(outputs[0, input_ids.shape[1] :], skip_special_tokens=True))
+inputs = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+).to(model.device)
+outputs = model.generate(**inputs, max_new_tokens=128)
+print(tokenizer.decode(outputs[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True))
 ```
 
 ## MiniMaxM2Config

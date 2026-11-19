@@ -608,6 +608,7 @@ class MiniMaxPreTrainedModel(PreTrainedModel):
         "hidden_states": MiniMaxDecoderLayer,
         "attentions": [MiniMaxAttention, MiniMaxLightningAttention],
     }
+    _uses_custom_cache = True  # MiniMaxCache
 
     @torch.no_grad()
     def _init_weights(self, module):
