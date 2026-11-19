@@ -75,14 +75,11 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
                 )
 
     def param_needs_quantization(self, model: "PreTrainedModel", param_name: str, **kwargs) -> bool:
-        if self.pre_quantized:
-            return False
-
         from ..integrations.finegrained_fp8 import FP8Expert, FP8Linear
 
         module, tensor_name = get_module_from_name(model, param_name)
         if isinstance(module, (FP8Linear, FP8Expert)):
-            if tensor_name == "bias":
+            if self.pre_quantized or tensor_name == "bias":
                 return False
             else:
                 return True
@@ -100,9 +97,6 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         model: "PreTrainedModel",
         **kwargs,
     ):
-        if self.quantization_config.dequantize:
-            return model
-
         from ..integrations.finegrained_fp8 import replace_with_fp8_linear
 
         self.modules_to_not_convert = self.get_modules_to_not_convert(
@@ -158,7 +152,8 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         return Fp8Quantize(self)
 
     def get_weight_conversions(self):
-        from ..core_model_loading import Fp8Dequantize, WeightConverter
+        from ..core_model_loading import WeightConverter
+        from ..integrations.finegrained_fp8 import Fp8Dequantize
 
         if self.pre_quantized and self.quantization_config.dequantize:
             return [

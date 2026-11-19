@@ -17,14 +17,21 @@ import tempfile
 import unittest
 
 from transformers import AutoConfig, is_torch_available
-from transformers.testing_utils import require_torch, torch_device
+from transformers.testing_utils import (
+    require_read_token,
+    require_torch,
+    require_torch_accelerator,
+    require_triton,
+    slow,
+    torch_device,
+)
 
 
 if is_torch_available():
     import torch
     from safetensors.torch import save_file
 
-    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM, MiniMaxM2Model
+    from transformers import AutoModelForCausalLM, AutoTokenizer, MiniMaxM2Config, MiniMaxM2ForCausalLM, MiniMaxM2Model
     from transformers.core_model_loading import revert_weight_conversion
     from transformers.models.minimax_m2.modeling_minimax_m2 import (
         MiniMaxM2Attention,
@@ -43,13 +50,12 @@ class MiniMaxM2ModelTester(CausalLMModelTester):
     def __init__(self, parent):
         super().__init__(parent, batch_size=3, num_experts=4)
         self.hidden_act = "silu"
-        self.rotary_dim = self.head_dim // 2
-        self.use_qk_norm = True
 
 
 @require_torch
 class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
     model_tester_class = MiniMaxM2ModelTester
+    # Not every expert or the routing-correction bias receives a gradient in a small routed batch.
     test_all_params_have_gradient = False
 
     # There is no tiny hub checkpoint for this architecture.
@@ -196,6 +202,7 @@ class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
         with torch.device("meta"):
             model = MiniMaxM2ForCausalLM(config)
         self.assertTrue(all(parameter.is_meta for parameter in model.parameters()))
+        self.assertTrue(all(buffer.is_meta for buffer in model.buffers()))
 
     def test_original_checkpoint_conversion_round_trip(self):
         config = self._tiny_config()
@@ -217,110 +224,23 @@ class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
         for name, tensor in model.state_dict().items():
             torch.testing.assert_close(loaded.state_dict()[name], tensor, rtol=0, atol=0)
 
-    def test_fp8_checkpoint_dequantization_and_expert_packing(self):
-        config = self._tiny_config()
-        model = MiniMaxM2ForCausalLM(config)
-        original_state = revert_weight_conversion(model, model.state_dict())
-        expected = {}
-        quantized_state = {}
-        for name, tensor in original_state.items():
-            if self._is_fp8_weight(name):
-                quantized, scales, dequantized = self._quantize_fp8(tensor)
-                quantized_state[name] = quantized
-                quantized_state[f"{name}_scale_inv"] = scales
-                expected[name] = dequantized
-            else:
-                quantized_state[name] = tensor
+    @require_triton()
+    def test_fp8_dequantization_for_stacked_experts(self):
+        from transformers import FineGrainedFP8Config
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+        from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 
-        config.quantization_config = {
-            "quant_method": "fp8",
-            "fmt": "float8_e4m3fn",
-            "activation_scheme": "dynamic",
-            "weight_block_size": [8, 8],
-            "modules_to_not_convert": ["gate", "e_score_correction_bias", "lm_head"],
-        }
-        packed_state = dict(model.state_dict())
-        prefix = "model.layers.0.mlp.experts"
-        packed_state[f"{prefix}.gate_up_proj"] = torch.stack(
-            [
-                torch.cat(
-                    (
-                        quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight"],
-                        quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w3.weight"],
-                    )
-                )
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        packed_state[f"{prefix}.gate_up_proj_scale_inv"] = torch.stack(
-            [
-                torch.cat(
-                    (
-                        quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight_scale_inv"],
-                        quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w3.weight_scale_inv"],
-                    )
-                )
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        packed_state[f"{prefix}.down_proj"] = torch.stack(
-            [
-                quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w2.weight"]
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        packed_state[f"{prefix}.down_proj_scale_inv"] = torch.stack(
-            [
-                quantized_state[f"model.layers.0.block_sparse_moe.experts.{expert}.w2.weight_scale_inv"]
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        reverted_state = revert_weight_conversion(model, packed_state)
-        for name, tensor in quantized_state.items():
-            if ".block_sparse_moe.experts." in name:
-                torch.testing.assert_close(reverted_state[name], tensor, rtol=0, atol=0)
+        weight = torch.randn(2, 16, 16)
+        scales = torch.rand(2, 2, 2) * 0.05 + 0.01
+        expanded_scales = scales.repeat_interleave(8, dim=1).repeat_interleave(8, dim=2)
+        quantized = (weight / expanded_scales).to(torch.float8_e4m3fn)
+        expected = quantized.float() * expanded_scales
+        quantizer = FineGrainedFP8HfQuantizer(FineGrainedFP8Config(weight_block_size=[8, 8]))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config.save_pretrained(tmpdir)
-            save_file(quantized_state, f"{tmpdir}/model.safetensors")
-            loaded, loading_info = MiniMaxM2ForCausalLM.from_pretrained(
-                tmpdir, attn_implementation="eager", output_loading_info=True
-            )
-
-        self.assertFalse(loading_info["missing_keys"])
-        self.assertFalse(loading_info["unexpected_keys"])
-        self.assertFalse(loading_info["mismatched_keys"])
-        self.assertFalse(loaded.is_quantized)
-        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            name = f"model.layers.0.self_attn.{projection}.weight"
-            actual = getattr(loaded.model.layers[0].self_attn, projection).weight
-            torch.testing.assert_close(actual, expected[name], rtol=0, atol=0)
-
-        gate_up = torch.stack(
-            [
-                torch.cat(
-                    (
-                        expected[f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight"],
-                        expected[f"model.layers.0.block_sparse_moe.experts.{expert}.w3.weight"],
-                    )
-                )
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        down = torch.stack(
-            [
-                expected[f"model.layers.0.block_sparse_moe.experts.{expert}.w2.weight"]
-                for expert in range(config.num_local_experts)
-            ]
-        )
-        torch.testing.assert_close(loaded.model.layers[0].mlp.experts.gate_up_proj, gate_up, rtol=0, atol=0)
-        torch.testing.assert_close(loaded.model.layers[0].mlp.experts.down_proj, down, rtol=0, atol=0)
-
-        input_ids = torch.randint(0, config.vocab_size, (2, 4))
-        attention_mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
-        with torch.no_grad():
-            outputs = loaded(input_ids, attention_mask=attention_mask, output_router_logits=True)
-        self.assertTrue(torch.isfinite(outputs.logits).all())
+        actual = Fp8Dequantize(quantizer).convert(
+            {"weight$": [quantized], "weight_scale_inv": [scales]}, full_layer_name="weight"
+        )["weight"]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @staticmethod
     def _tiny_config(**overrides):
@@ -334,26 +254,30 @@ class MiniMaxM2ModelTest(CausalLMModelTest, unittest.TestCase):
             "head_dim": 8,
             "num_local_experts": 2,
             "num_experts_per_tok": 1,
-            "rotary_dim": 4,
-            "use_qk_norm": True,
+            "partial_rotary_factor": 0.5,
             "pad_token_id": 0,
         }
         kwargs.update(overrides)
         return MiniMaxM2Config(**kwargs)
 
-    @staticmethod
-    def _is_fp8_weight(name):
-        return (
-            ".self_attn." in name and name.endswith(".weight") and "norm" not in name
-        ) or ".block_sparse_moe.experts." in name
 
-    @staticmethod
-    def _quantize_fp8(weight):
-        scales = torch.rand(weight.shape[0] // 8, weight.shape[1] // 8) * 0.05 + 0.01
-        expanded_scales = scales.repeat_interleave(8, dim=0).repeat_interleave(8, dim=1)
-        quantized = (weight / expanded_scales).to(torch.float8_e4m3fn)
-        dequantized = quantized.float() * expanded_scales
-        return quantized, scales, dequantized
+@require_torch_accelerator
+@slow
+@require_read_token
+class MiniMaxM2IntegrationTest(unittest.TestCase):
+    def test_released_checkpoint_generation(self):
+        checkpoint = "MiniMaxAI/MiniMax-M2.5"
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        model = AutoModelForCausalLM.from_pretrained(checkpoint, device_map="auto", dtype=torch.bfloat16)
+        messages = [{"role": "user", "content": "What is the capital of France? Answer with just the city name."}]
+        inputs = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        ).to(model.device)
+
+        with torch.no_grad():
+            generated = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+        response = tokenizer.decode(generated[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True)
+        self.assertIn("paris", response.lower())
 
 
 if __name__ == "__main__":

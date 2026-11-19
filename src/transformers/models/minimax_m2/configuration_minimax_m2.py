@@ -4,7 +4,7 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_minimax_m2.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-# Copyright 2025 The MiniMax team and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 The MiniMax team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,23 +22,92 @@ from ...modeling_rope_utils import RopeParameters
 
 
 class MiniMaxM2Config(PreTrainedConfig):
-    r"""Configuration class for [`MiniMaxM2Model`] and [`MiniMaxM2ForCausalLM`].
-
-    The configuration stores the dense attention and sparse mixture-of-experts parameters used by MiniMax-M2. The
-    `rotary_dim` and `rope_theta` arguments are accepted for compatibility with original MiniMax checkpoints, including
+    r"""
+    This is the configuration class to store the configuration of a [`MiniMaxM2Model`]. It is used to instantiate a
+    MiniMax-M2 model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a configuration similar to that of
     [MiniMaxAI/MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5).
+
+    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PreTrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 200064):
+            Vocabulary size of the MiniMax-M2 model. Defines the number of different tokens that can be represented by
+            the `input_ids` passed when calling [`MiniMaxM2Model`].
+        hidden_size (`int`, *optional*, defaults to 3072):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 1536):
+            Dimension of each expert's MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 62):
+            Number of hidden layers in the Transformer decoder.
+        num_attention_heads (`int`, *optional*, defaults to 48):
+            Number of attention heads for each attention layer in the Transformer decoder.
+        num_key_value_heads (`int`, *optional*, defaults to 8):
+            Number of key-value heads used to implement grouped-query attention. If
+            `num_key_value_heads=num_attention_heads`, the model uses multi-head attention; if
+            `num_key_value_heads=1`, it uses multi-query attention. If set to `None`, this defaults to
+            `num_attention_heads`.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimension of each attention head. If set to `None`, this defaults to
+            `hidden_size // num_attention_heads`.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function in the experts.
+        max_position_embeddings (`int`, *optional*, defaults to 196608):
+            Maximum sequence length supported by the model.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation used to initialize weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            Epsilon used by the RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether the model should return key/value caches for autoregressive decoding.
+        pad_token_id (`int`, *optional*):
+            The id of the padding token.
+        bos_token_id (`int`, *optional*, defaults to 0):
+            The id of the beginning-of-sequence token.
+        eos_token_id (`int`, *optional*, defaults to 200020):
+            The id of the end-of-sequence token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether the input and output word embeddings should be tied.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout ratio for the attention probabilities.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of experts selected for each token.
+        num_local_experts (`int`, *optional*, defaults to 256):
+            Number of experts in each sparse MLP layer.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether to return router logits and compute the auxiliary load-balancing loss.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
+            Coefficient of the auxiliary load-balancing loss in the total loss.
+        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
+            Fraction of each attention head dimension to which rotary embeddings are applied. The legacy `rotary_dim`
+            argument is converted to this factor when loading original checkpoints.
+        rope_parameters (`RopeParameters` or `dict`, *optional*):
+            Parameters for rotary position embeddings. By default, `rope_theta` is 5000000.0, `rope_type` is
+            `"default"`, and `partial_rotary_factor` is 0.5. Legacy `rope_theta` and `rope_scaling` arguments are
+            also accepted.
+        kwargs (`dict`, *optional*):
+            Additional configuration arguments, including metadata stored in original MiniMax checkpoints.
+
+    ```python
+    >>> from transformers import MiniMaxM2Config, MiniMaxM2Model
+
+    >>> configuration = MiniMaxM2Config()
+    >>> model = MiniMaxM2Model(configuration)
+    >>> configuration = model.config
+    ```
     """
 
     model_type = "minimax_m2"
     keys_to_ignore_at_inference = ["past_key_values"]
-    default_theta = 1e6
-    attribute_map = {"num_experts": "num_local_experts"}
+    default_theta = 5_000_000.0
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
         "layers.*.self_attn.v_proj": "colwise",
         "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.experts.gate_up_proj": "local_rowwise",
+        "layers.*.mlp.gate": "ep_router",  # we need to replicate here to correctly route experts
+        "layers.*.mlp.experts.gate_up_proj": "local_colwise",
         "layers.*.mlp.experts.down_proj": "local_rowwise",
         "layers.*.mlp.experts": "gather",
     }
@@ -47,68 +116,73 @@ class MiniMaxM2Config(PreTrainedConfig):
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
         "norm": (["hidden_states"], ["hidden_states"]),
     }
+    attribute_map = {
+        "num_experts": "num_local_experts",
+    }
 
     def __init__(
         self,
-        vocab_size: int | None = 32000,
-        hidden_size: int | None = 4096,
-        intermediate_size: int | None = 14336,
-        num_hidden_layers: int | None = 32,
-        num_attention_heads: int | None = 32,
+        vocab_size: int | None = 200064,
+        hidden_size: int | None = 3072,
+        intermediate_size: int | None = 1536,
+        num_hidden_layers: int | None = 62,
+        num_attention_heads: int | None = 48,
         num_key_value_heads: int | None = 8,
-        head_dim: int | None = None,
+        head_dim: int | None = 128,
         hidden_act: str | None = "silu",
-        max_position_embeddings: int | None = 131072,
+        max_position_embeddings: int | None = 196608,
         initializer_range: float | None = 0.02,
-        rms_norm_eps: float | None = 1e-5,
+        rms_norm_eps: float | None = 1e-6,
         use_cache: bool | None = True,
         pad_token_id: int | None = None,
-        bos_token_id: int | None = 1,
-        eos_token_id: int | None = 2,
+        bos_token_id: int | None = 0,
+        eos_token_id: int | None = 200020,
         tie_word_embeddings: bool | None = False,
-        rope_theta: float | None = 1e6,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
-        rotary_dim: int | None = None,
-        sliding_window: int | None = None,
         attention_dropout: float | None = 0.0,
-        num_experts_per_tok: int | None = 2,
-        num_local_experts: int | None = 8,
+        num_experts_per_tok: int | None = 8,
+        num_local_experts: int | None = 256,
         output_router_logits: bool | None = False,
         router_aux_loss_coef: float | None = 0.001,
-        router_jitter_noise: float | None = 0.0,
-        use_qk_norm: bool | None = False,
+        partial_rotary_factor: float | None = None,
+        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
         **kwargs,
     ):
+        kwargs.pop("use_qk_norm", None)  # Q/K normalization is always enabled for MiniMax-M2.
+        kwargs.pop("router_jitter_noise", None)
+        kwargs.pop("sliding_window", None)
+        rotary_dim = kwargs.pop("rotary_dim", None)
+        if rotary_dim is not None:
+            rotary_head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+            partial_rotary_factor = rotary_dim / rotary_head_dim
+        kwargs["partial_rotary_factor"] = 0.5 if partial_rotary_factor is None else partial_rotary_factor
+        # The released architecture uses full attention and deterministic routing.
+        sliding_window = None
+        router_jitter_noise = 0.0
         self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_attention_heads if num_key_value_heads is None else num_key_value_heads
-        self.head_dim = hidden_size // num_attention_heads if head_dim is None else head_dim
+        self.sliding_window = sliding_window
+
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        self.sliding_window = sliding_window
         self.attention_dropout = attention_dropout
+        self.head_dim = head_dim
+
         self.num_experts_per_tok = num_experts_per_tok
         self.num_local_experts = num_local_experts
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_jitter_noise = router_jitter_noise
-        self.use_qk_norm = use_qk_norm
-
-        partial_rotary_factor = kwargs.pop("partial_rotary_factor", None)
-        if rotary_dim is None:
-            if partial_rotary_factor is None and isinstance(rope_parameters, dict):
-                partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
-            if partial_rotary_factor is None:
-                partial_rotary_factor = 1.0
-            rotary_dim = int(self.head_dim * partial_rotary_factor)
-        self.rotary_dim = rotary_dim
-        self.partial_rotary_factor = rotary_dim / self.head_dim if self.head_dim else 0.0
         self.rope_parameters = rope_parameters
 
         super().__init__(
@@ -116,10 +190,9 @@ class MiniMaxM2Config(PreTrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            rope_theta=rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
             **kwargs,
         )
+        self.partial_rotary_factor = self.rope_parameters["partial_rotary_factor"]
 
 
 __all__ = ["MiniMaxM2Config"]

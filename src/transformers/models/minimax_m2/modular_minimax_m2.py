@@ -1,4 +1,4 @@
-# Copyright 2025 The MiniMax team and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 The MiniMax team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,146 +16,193 @@
 from collections.abc import Callable
 
 import torch
-from torch import nn
+from torch.nn import init
 
-from ... import initialization as init
 from ...cache_utils import Cache
-from ...configuration_utils import PreTrainedConfig
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import MoeCausalLMOutputWithPast
 from ...modeling_rope_utils import RopeParameters
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, load_balancing_loss_func
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel, load_balancing_loss_func
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring
 from ...utils.generic import OutputRecorder, can_return_tuple
-from ..llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding, eager_attention_forward, rotate_half
+from ..glm.modeling_glm import GlmRotaryEmbedding
+from ..gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
+from ..llama.modeling_llama import LlamaRMSNorm, eager_attention_forward
 from ..mistral.modeling_mistral import MistralAttention
+from ..mixtral.configuration_mixtral import MixtralConfig
 from ..mixtral.modeling_mixtral import (
     MixtralDecoderLayer,
     MixtralExperts,
     MixtralForCausalLM,
     MixtralModel,
     MixtralPreTrainedModel,
+    MixtralSparseMoeBlock,
+    MixtralTopKRouter,
 )
 
 
-class MiniMaxM2Config(PreTrainedConfig):
-    r"""Configuration class for [`MiniMaxM2Model`] and [`MiniMaxM2ForCausalLM`].
-
-    The configuration stores the dense attention and sparse mixture-of-experts parameters used by MiniMax-M2. The
-    `rotary_dim` and `rope_theta` arguments are accepted for compatibility with original MiniMax checkpoints, including
+class MiniMaxM2Config(MixtralConfig):
+    r"""
+    This is the configuration class to store the configuration of a [`MiniMaxM2Model`]. It is used to instantiate a
+    MiniMax-M2 model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a configuration similar to that of
     [MiniMaxAI/MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5).
+
+    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
+    documentation from [`PreTrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 200064):
+            Vocabulary size of the MiniMax-M2 model. Defines the number of different tokens that can be represented by
+            the `input_ids` passed when calling [`MiniMaxM2Model`].
+        hidden_size (`int`, *optional*, defaults to 3072):
+            Dimension of the hidden representations.
+        intermediate_size (`int`, *optional*, defaults to 1536):
+            Dimension of each expert's MLP representations.
+        num_hidden_layers (`int`, *optional*, defaults to 62):
+            Number of hidden layers in the Transformer decoder.
+        num_attention_heads (`int`, *optional*, defaults to 48):
+            Number of attention heads for each attention layer in the Transformer decoder.
+        num_key_value_heads (`int`, *optional*, defaults to 8):
+            Number of key-value heads used to implement grouped-query attention. If
+            `num_key_value_heads=num_attention_heads`, the model uses multi-head attention; if
+            `num_key_value_heads=1`, it uses multi-query attention. If set to `None`, this defaults to
+            `num_attention_heads`.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimension of each attention head. If set to `None`, this defaults to
+            `hidden_size // num_attention_heads`.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function in the experts.
+        max_position_embeddings (`int`, *optional*, defaults to 196608):
+            Maximum sequence length supported by the model.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            Standard deviation used to initialize weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
+            Epsilon used by the RMS normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether the model should return key/value caches for autoregressive decoding.
+        pad_token_id (`int`, *optional*):
+            The id of the padding token.
+        bos_token_id (`int`, *optional*, defaults to 0):
+            The id of the beginning-of-sequence token.
+        eos_token_id (`int`, *optional*, defaults to 200020):
+            The id of the end-of-sequence token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether the input and output word embeddings should be tied.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            Dropout ratio for the attention probabilities.
+        num_experts_per_tok (`int`, *optional*, defaults to 8):
+            Number of experts selected for each token.
+        num_local_experts (`int`, *optional*, defaults to 256):
+            Number of experts in each sparse MLP layer.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether to return router logits and compute the auxiliary load-balancing loss.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
+            Coefficient of the auxiliary load-balancing loss in the total loss.
+        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
+            Fraction of each attention head dimension to which rotary embeddings are applied. The legacy `rotary_dim`
+            argument is converted to this factor when loading original checkpoints.
+        rope_parameters (`RopeParameters` or `dict`, *optional*):
+            Parameters for rotary position embeddings. By default, `rope_theta` is 5000000.0, `rope_type` is
+            `"default"`, and `partial_rotary_factor` is 0.5. Legacy `rope_theta` and `rope_scaling` arguments are
+            also accepted.
+        kwargs (`dict`, *optional*):
+            Additional configuration arguments, including metadata stored in original MiniMax checkpoints.
+
+    ```python
+    >>> from transformers import MiniMaxM2Config, MiniMaxM2Model
+
+    >>> configuration = MiniMaxM2Config()
+    >>> model = MiniMaxM2Model(configuration)
+    >>> configuration = model.config
+    ```
     """
 
     model_type = "minimax_m2"
-    keys_to_ignore_at_inference = ["past_key_values"]
-    default_theta = 1e6
-    attribute_map = {"num_experts": "num_local_experts"}
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.experts.gate_up_proj": "local_rowwise",
-        "layers.*.mlp.experts.down_proj": "local_rowwise",
-        "layers.*.mlp.experts": "gather",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
+    default_theta = 5_000_000.0
 
     def __init__(
         self,
-        vocab_size: int | None = 32000,
-        hidden_size: int | None = 4096,
-        intermediate_size: int | None = 14336,
-        num_hidden_layers: int | None = 32,
-        num_attention_heads: int | None = 32,
+        vocab_size: int | None = 200064,
+        hidden_size: int | None = 3072,
+        intermediate_size: int | None = 1536,
+        num_hidden_layers: int | None = 62,
+        num_attention_heads: int | None = 48,
         num_key_value_heads: int | None = 8,
-        head_dim: int | None = None,
+        head_dim: int | None = 128,
         hidden_act: str | None = "silu",
-        max_position_embeddings: int | None = 131072,
+        max_position_embeddings: int | None = 196608,
         initializer_range: float | None = 0.02,
-        rms_norm_eps: float | None = 1e-5,
+        rms_norm_eps: float | None = 1e-6,
         use_cache: bool | None = True,
         pad_token_id: int | None = None,
-        bos_token_id: int | None = 1,
-        eos_token_id: int | None = 2,
+        bos_token_id: int | None = 0,
+        eos_token_id: int | None = 200020,
         tie_word_embeddings: bool | None = False,
-        rope_theta: float | None = 1e6,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
-        rotary_dim: int | None = None,
-        sliding_window: int | None = None,
         attention_dropout: float | None = 0.0,
-        num_experts_per_tok: int | None = 2,
-        num_local_experts: int | None = 8,
+        num_experts_per_tok: int | None = 8,
+        num_local_experts: int | None = 256,
         output_router_logits: bool | None = False,
         router_aux_loss_coef: float | None = 0.001,
-        router_jitter_noise: float | None = 0.0,
-        use_qk_norm: bool | None = False,
+        partial_rotary_factor: float | None = None,
+        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
         **kwargs,
     ):
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_attention_heads if num_key_value_heads is None else num_key_value_heads
-        self.head_dim = hidden_size // num_attention_heads if head_dim is None else head_dim
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.sliding_window = sliding_window
-        self.attention_dropout = attention_dropout
-        self.num_experts_per_tok = num_experts_per_tok
-        self.num_local_experts = num_local_experts
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.router_jitter_noise = router_jitter_noise
-        self.use_qk_norm = use_qk_norm
-
-        partial_rotary_factor = kwargs.pop("partial_rotary_factor", None)
-        if rotary_dim is None:
-            if partial_rotary_factor is None and isinstance(rope_parameters, dict):
-                partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
-            if partial_rotary_factor is None:
-                partial_rotary_factor = 1.0
-            rotary_dim = int(self.head_dim * partial_rotary_factor)
-        self.rotary_dim = rotary_dim
-        self.partial_rotary_factor = rotary_dim / self.head_dim if self.head_dim else 0.0
-        self.rope_parameters = rope_parameters
+        kwargs.pop("use_qk_norm", None)  # Q/K normalization is always enabled for MiniMax-M2.
+        kwargs.pop("router_jitter_noise", None)
+        kwargs.pop("sliding_window", None)
+        rotary_dim = kwargs.pop("rotary_dim", None)
+        if rotary_dim is not None:
+            rotary_head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
+            partial_rotary_factor = rotary_dim / rotary_head_dim
+        kwargs["partial_rotary_factor"] = 0.5 if partial_rotary_factor is None else partial_rotary_factor
+        # The released architecture uses full attention and deterministic routing.
+        sliding_window = None
+        router_jitter_noise = 0.0
 
         super().__init__(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            head_dim=head_dim,
+            hidden_act=hidden_act,
+            max_position_embeddings=max_position_embeddings,
+            initializer_range=initializer_range,
+            rms_norm_eps=rms_norm_eps,
+            use_cache=use_cache,
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            rope_theta=rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
+            sliding_window=sliding_window,
+            attention_dropout=attention_dropout,
+            num_experts_per_tok=num_experts_per_tok,
+            num_local_experts=num_local_experts,
+            output_router_logits=output_router_logits,
+            router_aux_loss_coef=router_aux_loss_coef,
+            router_jitter_noise=router_jitter_noise,
+            rope_parameters=rope_parameters,
             **kwargs,
         )
+        self.partial_rotary_factor = self.rope_parameters["partial_rotary_factor"]
 
 
 class MiniMaxM2Experts(MixtralExperts):
     pass
 
 
-class MiniMaxM2TopKRouter(nn.Module):
+class MiniMaxM2TopKRouter(MixtralTopKRouter):
     def __init__(self, config: MiniMaxM2Config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
+        super().__init__(config)
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts))
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        router_logits = nn.functional.linear(hidden_states, self.weight)
+        router_logits = torch.nn.functional.linear(hidden_states, self.weight)
         routing_weights = torch.sigmoid(router_logits.float())
         scores_for_choice = routing_weights + self.e_score_correction_bias
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
@@ -164,19 +211,14 @@ class MiniMaxM2TopKRouter(nn.Module):
         return router_logits, top_k_weights.to(router_logits.dtype), top_k_index
 
 
-class MiniMaxM2SparseMoeBlock(nn.Module):
+class MiniMaxM2SparseMoeBlock(MixtralSparseMoeBlock):
     def __init__(self, config: MiniMaxM2Config):
-        super().__init__()
-        self.jitter_noise = config.router_jitter_noise
+        super().__init__(config)
         self.gate = MiniMaxM2TopKRouter(config)
-        self.experts = MiniMaxM2Experts(config)
+        del self.jitter_noise
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.jitter_noise > 0:
-            hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
-                1.0 - self.jitter_noise, 1.0 + self.jitter_noise
-            )
         hidden_states = hidden_states.view(-1, hidden_dim)
         _, routing_weights, selected_experts = self.gate(hidden_states)
         hidden_states = self.experts(hidden_states, selected_experts, routing_weights.to(hidden_states.dtype))
@@ -187,39 +229,15 @@ class MiniMaxM2RMSNorm(LlamaRMSNorm):
     pass
 
 
-class MiniMaxM2RotaryEmbedding(LlamaRotaryEmbedding):
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: MiniMaxM2Config | None = None,
-        device: torch.device | None = None,
-        seq_len: int | None = None,
-    ) -> tuple[torch.Tensor, float]:
-        base = config.rope_parameters["rope_theta"]
-        dim = config.rotary_dim
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, 1.0
-
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = torch.cat(((q_rot * cos) + (rotate_half(q_rot) * sin), q_pass), dim=-1)
-    k_embed = torch.cat(((k_rot * cos) + (rotate_half(k_rot) * sin), k_pass), dim=-1)
-    return q_embed, k_embed
+class MiniMaxM2RotaryEmbedding(GlmRotaryEmbedding):
+    pass
 
 
 class MiniMaxM2Attention(MistralAttention):
     def __init__(self, config: MiniMaxM2Config, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.use_qk_norm = config.use_qk_norm
-        if self.use_qk_norm:
-            self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
-            self.k_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_key_value_heads, eps=config.rms_norm_eps)
+        self.q_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_attention_heads, eps=config.rms_norm_eps)
+        self.k_norm = MiniMaxM2RMSNorm(self.head_dim * config.num_key_value_heads, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -233,16 +251,9 @@ class MiniMaxM2Attention(MistralAttention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
+        query_states = self.q_norm(self.q_proj(hidden_states)).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states)).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        if self.use_qk_norm:
-            query_states = self.q_norm(query_states)
-            key_states = self.k_norm(key_states)
-
-        query_states = query_states.view(hidden_shape).transpose(1, 2)
-        key_states = key_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -283,8 +294,13 @@ class MiniMaxM2PreTrainedModel(MixtralPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
-        super()._init_weights(module)
-        if isinstance(module, MiniMaxM2TopKRouter):
+        PreTrainedModel._init_weights(self, module)
+        std = self.config.initializer_range
+        if isinstance(module, MiniMaxM2Experts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            init.normal_(module.down_proj, mean=0.0, std=std)
+        elif isinstance(module, MiniMaxM2TopKRouter):
+            init.normal_(module.weight, mean=0.0, std=std)
             init.zeros_(module.e_score_correction_bias)
 
 

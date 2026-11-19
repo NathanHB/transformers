@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from ..core_model_loading import ConversionOps
-from ..core_model_loading import Fp8Dequantize as Fp8Dequantize
 from ..quantizers.quantizers_utils import should_convert_module
 from ..utils import is_torch_accelerator_available, is_torch_available, logging
 
@@ -710,4 +709,45 @@ class Fp8Quantize(ConversionOps):
         return {
             target_keys: quantized,
             scale_key: inv_scales,
+        }
+
+
+class Fp8Dequantize(ConversionOps):
+    """Inverse operation of :class:`Fp8Quantize`. Takes a pair (weight, scale) and reconstructs the fp32 tensor."""
+
+    def __init__(self, hf_quantizer):
+        self.hf_quantizer = hf_quantizer
+
+    def convert(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        full_layer_name: str | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        if len(input_dict) < 2:
+            # case where we only got weights, need to check for "weight$"
+            return {full_layer_name: input_dict["weight$"]}
+
+        quantized = input_dict["weight$"][0]
+        scales = input_dict["weight_scale_inv"][0]
+
+        rows, cols = quantized.shape[-2:]
+        block_size = self.hf_quantizer.quantization_config.weight_block_size
+        if block_size is None:
+            block_size = (quantized.shape[-2], quantized.shape[-1])
+
+        block_m, block_n = block_size
+
+        if rows % block_m != 0 or cols % block_n != 0:
+            raise ValueError(
+                f"Matrix dimensions ({rows}, {cols}) must be divisible by block sizes ({block_m}, {block_n})."
+            )
+        quantized = quantized.to(scales.dtype)
+        reshaped = quantized.reshape(-1, rows // block_m, block_m, cols // block_n, block_n)
+        expanded_scales = scales.reshape(-1, rows // block_m, cols // block_n)
+        expanded_scales = expanded_scales.unsqueeze(-1).unsqueeze(2)
+        dequantized = reshaped * expanded_scales
+
+        return {
+            full_layer_name: dequantized.reshape(quantized.shape),
         }

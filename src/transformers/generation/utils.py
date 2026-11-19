@@ -1898,13 +1898,11 @@ class GenerationMixin(ContinuousMixin):
         """
         # NOTE: remove xlnet/reformer when the models are deprecated, non-standard model architecture/cache name
         model_name = cls.__name__.lower()
-        if model_name.startswith("minimaxm2"):
-            return not cls._is_stateful
         return not cls._is_stateful and all(
             special_model_name not in model_name
             for special_model_name in [
                 "reformer",
-                "minimax",
+                "minimaxfor",
                 "xlnet",
                 "lfm2",
                 "lfm2_vl",

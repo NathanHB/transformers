@@ -16,11 +16,13 @@ rendered properly in your Markdown viewer.
 
 # MiniMax-M2
 
+*This model was released on {release_date} and added to Hugging Face Transformers on 2026-11-18.*
+
 ## Overview
 
 MiniMax-M2 is a sparse mixture-of-experts causal language model developed by MiniMax. The architecture combines grouped-query attention with partial rotary position embeddings and per-projection query/key normalization. Each decoder layer routes tokens to a subset of feed-forward experts using sigmoid routing scores and a correction bias for expert selection.
 
-The native implementation supports the original MiniMax-M2.5 checkpoints, including their unpacked expert tensor format and block-scaled FP8 weights. The `quantization_config.dequantize` option can be used to dequantize FP8 checkpoints for devices without FP8 support.
+The implementation converts the original per-expert checkpoint layout to the packed expert layout used by Transformers.
 
 ```python
 import torch

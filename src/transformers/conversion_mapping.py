@@ -21,9 +21,7 @@ from .core_model_loading import (
     Chunk,
     Concatenate,
     ErnieFuseAndSplitTextVisionExperts,
-    MergeMiniMaxM2Experts,
     MergeModulelist,
-    MiniMaxM2WeightConverter,
     Transpose,
     WeightConverter,
     WeightRenaming,
@@ -67,28 +65,6 @@ def _build_checkpoint_conversion_mapping():
                         dim=0
                     ),  # each process has two lists of tensors, we cat each list. -> we end up with 2 tensors
                 ],  # we want the loading to add this shard operation here. Though we can't shard after concats and merge, needs to be first
-            ),
-        ],
-        "minimax_m2": [
-            WeightRenaming(".block_sparse_moe.e_score_correction_bias", ".mlp.gate.e_score_correction_bias"),
-            WeightRenaming(".block_sparse_moe.gate", ".mlp.gate"),
-            MiniMaxM2WeightConverter(
-                source_patterns=[
-                    "block_sparse_moe.experts.*.w1.weight",
-                    "block_sparse_moe.experts.*.w1.weight_scale_inv",
-                    "block_sparse_moe.experts.*.w3.weight",
-                    "block_sparse_moe.experts.*.w3.weight_scale_inv",
-                ],
-                target_patterns=["mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj_scale_inv"],
-                operations=[MergeMiniMaxM2Experts(dim=1, num_projections=2)],
-            ),
-            MiniMaxM2WeightConverter(
-                source_patterns=[
-                    "block_sparse_moe.experts.*.w2.weight",
-                    "block_sparse_moe.experts.*.w2.weight_scale_inv",
-                ],
-                target_patterns=["mlp.experts.down_proj", "mlp.experts.down_proj_scale_inv"],
-                operations=[MergeMiniMaxM2Experts(dim=1, num_projections=1)],
             ),
         ],
         "qwen2_moe": [
@@ -260,6 +236,9 @@ def _build_checkpoint_conversion_mapping():
     mapping["qwen3_vl_moe"] = mapping["qwen2_moe"].copy()
     mapping["hunyuan_v1_moe"] = mapping["qwen2_moe"].copy()
     mapping["minimax"] = mapping["mixtral"].copy()
+    mapping["minimax_m2"] = [
+        WeightRenaming(".block_sparse_moe.e_score_correction_bias", ".mlp.gate.e_score_correction_bias")
+    ] + mapping["mixtral"].copy()
     mapping["flex_olmo"] = mapping["qwen2_moe"].copy()
     mapping["olmoe"] = mapping["qwen2_moe"].copy()
 
@@ -345,16 +324,6 @@ def get_model_conversion_mapping(
     if model_type is not None:
         model_specific_conversions = get_checkpoint_conversion_mapping(model_type)
         if model_specific_conversions is not None:
-            if model_type == "minimax_m2" and getattr(model.config, "quantization_config", None) is None:
-                for conversion in model_specific_conversions:
-                    if isinstance(conversion, MiniMaxM2WeightConverter):
-                        conversion.source_patterns = [
-                            pattern for pattern in conversion.source_patterns if not pattern.endswith("_scale_inv")
-                        ]
-                        conversion.target_patterns = [
-                            pattern for pattern in conversion.target_patterns if not pattern.endswith("_scale_inv")
-                        ]
-                        conversion.__post_init__()
             weight_conversions.extend(model_specific_conversions)
 
     if add_legacy:
